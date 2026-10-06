@@ -29,6 +29,12 @@ import {
   TODO_CANONICAL_READ_RECORD_SCHEMA,
 } from "../../loopx/control_plane/coordination/coordination_projection.ts";
 import { canonicalAuthoritySha256 } from "../../loopx/control_plane/coordination/authority_store_codec.ts";
+import {
+  findDownstream,
+  checkReadiness,
+  buildBackfillMutations,
+  type TodoDependencyEdge,
+} from "./dependency.ts";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -382,6 +388,184 @@ app.post("/v1/todos/:todoId/lease/acquire", async (c) => {
 
   const status = result.status === "failed" ? 409 : 200;
   return c.json(result, status);
+});
+
+// ─── Phase 4: Todo Dependency DAG + Backfill ────────────────────────────────
+
+// Add a dependency edge between two todos.
+app.post("/v1/goals/:goalId/dependencies", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+
+  interface DepEdge {
+    upstream_todo_id: string;
+    downstream_todo_id: string;
+    dependency_type: string;
+    upstream_commit_sha?: string;
+    gate_id?: string;
+  }
+  let body: {dependencies: DepEdge[]};
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({detail: "invalid JSON body"}, 400);
+  }
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") {
+    return c.json({detail: "goal head not found; create todos first"}, 404);
+  }
+  const currentHead = head.head as Record<string, unknown>;
+  const existingDeps = Array.isArray(currentHead.todo_dependencies)
+    ? [...currentHead.todo_dependencies] as TodoDependencyEdge[] : [];
+  const todos = Array.isArray(currentHead.todos) ? currentHead.todos as Array<{todo_id: string}> : [];
+
+  // Validate all referenced todos exist.
+  const todoIds = new Set(todos.map(t => t.todo_id));
+  for (const dep of body.dependencies) {
+    if (!todoIds.has(dep.upstream_todo_id)) {
+      return c.json({detail: `upstream todo not found: ${dep.upstream_todo_id}`}, 404);
+    }
+    if (!todoIds.has(dep.downstream_todo_id)) {
+      return c.json({detail: `downstream todo not found: ${dep.downstream_todo_id}`}, 404);
+    }
+    if (!["hard_completion", "gate_acceptance", "source_commit_current"].includes(dep.dependency_type)) {
+      return c.json({detail: `invalid dependency_type: ${dep.dependency_type}`}, 422);
+    }
+  }
+
+  const newEdges: TodoDependencyEdge[] = body.dependencies.map(d => ({
+    upstream_todo_id: d.upstream_todo_id,
+    downstream_todo_id: d.downstream_todo_id,
+    dependency_type: d.dependency_type as TodoDependencyEdge["dependency_type"],
+    upstream_commit_sha: d.upstream_commit_sha ?? null,
+    gate_id: d.gate_id ?? null,
+  }));
+
+  const allDeps = [...existingDeps, ...newEdges];
+  const nextProjection = {...currentHead, todo_dependencies: allDeps};
+  const operationId = `dep-add:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: head.provider_revision,
+    operation_id: operationId,
+    events: newEdges.map(e => ({type: "DependencyAdded", payload: e as unknown as Record<string, unknown>})),
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "applied"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({status: "created", dependency_count: allDeps.length}, 201);
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// Check if a todo is ready to execute.
+app.get("/v1/goals/:goalId/todos/:todoId/readiness", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+  const todoId = c.req.param("todoId");
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") {
+    return c.json({detail: "goal not found"}, 404);
+  }
+  const currentHead = head.head as Record<string, unknown>;
+  const todos = Array.isArray(currentHead.todos) ? currentHead.todos as Array<{todo_id: string; status: string}> : [];
+  const deps = Array.isArray(currentHead.todo_dependencies) ? currentHead.todo_dependencies as TodoDependencyEdge[] : [];
+
+  const readiness = checkReadiness(todoId, todos, deps);
+  return c.json({todo_id: todoId, ...readiness});
+});
+
+// Trigger Backfill: mark downstream todos as provisional/paused/reopened.
+app.post("/v1/goals/:goalId/backfill", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+
+  interface BackfillRequest {
+    upstream_todo_id: string;
+    new_commit_sha: string;
+    reason?: string;
+  }
+  let body: BackfillRequest;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({detail: "invalid JSON body"}, 400);
+  }
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") {
+    return c.json({detail: "goal not found"}, 404);
+  }
+  const currentHead = head.head as Record<string, unknown>;
+  const todos = Array.isArray(currentHead.todos)
+    ? currentHead.todos as Array<{todo_id: string; status: string; claimed_by: string | null} & Record<string, unknown>>
+    : [];
+  const deps = Array.isArray(currentHead.todo_dependencies) ? currentHead.todo_dependencies as TodoDependencyEdge[] : [];
+
+  // Build mutations for all downstream todos.
+  const todoData = todos.map(t => ({
+    todo_id: t.todo_id,
+    status: t.status,
+    claimed_by: t.claimed_by,
+    todo: t as Record<string, unknown>,
+  }));
+  const mutations = buildBackfillMutations(deps, body.upstream_todo_id, todoData);
+
+  if (mutations.length === 0) {
+    return c.json({status: "no_downstream", affected: 0});
+  }
+
+  // Build next projection with backfill status changes.
+  const mutationMap = new Map(mutations.map(m => [m.todo_id, m]));
+  const updatedTodos = todos.map(t => {
+    const m = mutationMap.get(t.todo_id);
+    if (!m) return t;
+    return {...t, status: m.new_status, backfill_marker: `backfill-from:${body.upstream_todo_id}`};
+  });
+
+  // Rebuild read model.
+  const sortedTodos = [...updatedTodos].sort((a, b) => a.todo_id.localeCompare(b.todo_id));
+  const readModel = coordinationTodoReadModel(
+    sortedTodos as unknown as Array<Record<string, unknown>>,
+    TODO_CANONICAL_READ_RECORD_SCHEMA,
+  );
+  const nextProjection = {
+    ...currentHead,
+    todos: sortedTodos,
+    todo_read_model: readModel,
+  };
+
+  const operationId = `backfill:${body.upstream_todo_id}:${Date.now()}`;
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: head.provider_revision,
+    operation_id: operationId,
+    events: [{
+      type: "BackfillPropagated",
+      payload: {
+        upstream_todo_id: body.upstream_todo_id,
+        new_commit_sha: body.new_commit_sha,
+        reason: body.reason ?? "backfill",
+        affected: mutations.map(m => ({todo_id: m.todo_id, old: m.old_status, new: m.new_status})),
+      } as unknown as Record<string, unknown>,
+    }],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "applied"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({
+      status: "propagated",
+      upstream_todo_id: body.upstream_todo_id,
+      affected: mutations.map(m => ({todo_id: m.todo_id, old_status: m.old_status, new_status: m.new_status})),
+    });
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
