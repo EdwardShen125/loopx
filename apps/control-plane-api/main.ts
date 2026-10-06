@@ -24,6 +24,11 @@ import {
 import {
   executeCanonicalTaskLeaseAcquire,
 } from "../../loopx/control_plane/coordination/task_lease_acquire.ts";
+import {
+  coordinationTodoReadModel,
+  TODO_CANONICAL_READ_RECORD_SCHEMA,
+} from "../../loopx/control_plane/coordination/coordination_projection.ts";
+import { canonicalAuthoritySha256 } from "../../loopx/control_plane/coordination/authority_store_codec.ts";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -246,6 +251,95 @@ app.post("/v1/receipts/platform", async (c) => {
     });
   }
 
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// ─── Todo management (create todos in a Goal head) ─────────────────────────
+
+app.post("/v1/goals/:goalId/todos", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+
+  interface TodoItem {
+    todo_id: string;
+    text: string;
+    role?: string;
+    status?: string;
+    task_class?: string;
+  }
+  let body: {todos: TodoItem[]};
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({detail: "invalid JSON body"}, 400);
+  }
+
+  const store = new PostgreSqlAuthorityStore(database, {
+    tenant_id: tenantId,
+    goal_id: goalId,
+  });
+
+  // Load current head or create initial projection.
+  const head = await store.loadAuthority();
+  const expectedRevision = head.status === "loaded" ? head.provider_revision : null;
+  const currentHead = head.status === "loaded" ? head.head : null;
+  const existingTodos = Array.isArray((currentHead as any)?.todos)
+    ? [...(currentHead as any).todos] : [];
+
+  // Append new todos with todo_item_v0 schema.
+  const newTodos = body.todos.map((t, i) => ({
+    schema_version: "todo_item_v0",
+    todo_id: t.todo_id,
+    index: existingTodos.length + i,
+    done: false,
+    text: t.text,
+    role: t.role ?? "agent",
+    status: t.status ?? "open",
+    priority: null,
+    title: null,
+    archive_state: "active",
+    source_section: "Agent Todo",
+    task_class: t.task_class ?? "advancement_task",
+    action_kind: null,
+    task_domain: null,
+    capability_binding_ref: null,
+    task_repository: null,
+    continuation_policy: null,
+    removed_continuation_policy: null,
+    claimed_by: null,
+    excluded_agents: [],
+  }));
+
+  const allTodos = [...existingTodos, ...newTodos];
+  // Sort by todo_id (deterministic order required by projection validation).
+  allTodos.sort((a, b) => a.todo_id.localeCompare(b.todo_id));
+  const readModel = coordinationTodoReadModel(
+    allTodos as unknown as Array<Record<string, unknown>>,
+    TODO_CANONICAL_READ_RECORD_SCHEMA,
+  );
+  const nextProjection = {
+    ...(currentHead as Record<string, unknown> ?? {}),
+    goal_id: goalId,
+    todos: allTodos,
+    leases: [],
+    todo_read_model: readModel,
+  };
+
+  const operationId = `todo-create:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: expectedRevision,
+    operation_id: operationId,
+    events: newTodos.map(t => ({
+      type: "TodoCreated",
+      payload: t as unknown as Record<string, unknown>,
+    })),
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "applied"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({status: "created", todo_count: nextProjection.todos.length}, 201);
+  }
   return c.json({detail: "commit failed", reason: commitResult.status}, 500);
 });
 
