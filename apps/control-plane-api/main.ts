@@ -1071,6 +1071,244 @@ app.get("/v1/goals/:goalId/gates", async (c) => {
   return c.json({gates: [...gateStatus, ...implicitGates]});
 });
 
+// ─── ExecutionPlan workflow (design §5: draft → validate → approve → start) ──
+
+interface ExecutionPlanDraft {
+  plan_id: string;
+  template_id: string;
+  template_version: string;
+  goal_id: string;
+  sample_name: string;
+  depth_tier: "A" | "B" | "C";
+  stages: string[];
+  policy?: Record<string, unknown>;
+  tool_permissions?: string[];
+  budget?: Record<string, unknown>;
+}
+
+// POST /v1/execution-plans — CreateExecutionPlanDraft
+app.post("/v1/execution-plans", async (c) => {
+  const tenantId = c.get("tenantId");
+
+  let draft: ExecutionPlanDraft;
+  try {
+    draft = await c.req.json();
+  } catch {
+    return c.json({detail: "invalid JSON body"}, 400);
+  }
+  if (!draft.plan_id || !draft.template_id || !draft.goal_id || !draft.stages?.length) {
+    return c.json({detail: "plan_id, template_id, goal_id, stages are required"}, 422);
+  }
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: draft.goal_id});
+  const head = await store.loadAuthority();
+  const expectedRevision = head.status === "loaded" ? head.provider_revision : null;
+  const currentHead = head.status === "loaded" ? head.head as Record<string, unknown> : {};
+
+  // Check for existing plans.
+  const plans = Array.isArray(currentHead.execution_plans)
+    ? [...currentHead.execution_plans] as Array<{plan_id: string; status: string}>
+    : [];
+  if (plans.some(p => p.plan_id === draft.plan_id)) {
+    return c.json({detail: `plan already exists: ${draft.plan_id}`}, 409);
+  }
+
+  const planRevision = {
+    plan_id: draft.plan_id,
+    plan_revision: 1,
+    template_id: draft.template_id,
+    template_version: draft.template_version ?? "1.0.0",
+    goal_id: draft.goal_id,
+    status: "draft" as const,
+    sample_name: draft.sample_name,
+    depth_tier: draft.depth_tier,
+    stages: draft.stages,
+    policy: draft.policy ?? {},
+    tool_permissions: draft.tool_permissions ?? [],
+    budget: draft.budget ?? {},
+    created_at: new Date().toISOString(),
+    approved_by: null,
+    approved_at: null,
+  };
+
+  plans.push(planRevision);
+  const nextProjection = {...currentHead, execution_plans: plans};
+  const operationId = `plan-create:${draft.plan_id}:rev1`;
+
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: expectedRevision,
+    operation_id: operationId,
+    events: [{type: "ExecutionPlanDraftCreated", payload: planRevision as unknown as Record<string, unknown>}],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "applied"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({
+      plan_id: draft.plan_id,
+      plan_revision: 1,
+      status: "draft",
+      goal_id: draft.goal_id,
+    }, 201);
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// POST /v1/execution-plans/:planId/validate — ValidateExecutionPlan
+app.post("/v1/execution-plans/:planId/validate", async (c) => {
+  const tenantId = c.get("tenantId");
+  const planId = c.req.param("planId");
+
+  const goalId = c.req.query("goal_id") ?? "";
+  if (!goalId) return c.json({detail: "goal_id query parameter required"}, 422);
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") return c.json({detail: "goal not found"}, 404);
+
+  const currentHead = head.head as Record<string, unknown>;
+  const plans = Array.isArray(currentHead.execution_plans)
+    ? currentHead.execution_plans as Array<Record<string, unknown> & {plan_id: string; status: string; stages?: string[]}>
+    : [];
+  const plan = plans.find(p => p.plan_id === planId);
+  if (!plan) return c.json({detail: `plan not found: ${planId}`}, 404);
+  if (plan.status !== "draft") return c.json({detail: `plan status is ${plan.status}, expected draft`}, 409);
+
+  // Validate required fields.
+  const errors: string[] = [];
+  if (!plan.sample_name) errors.push("sample_name is required");
+  if (!plan.depth_tier) errors.push("depth_tier is required");
+  if (!Array.isArray(plan.stages) || (plan.stages as string[]).length === 0) errors.push("stages must be non-empty");
+  if (!plan.template_id) errors.push("template_id is required");
+
+  return c.json({
+    plan_id: planId,
+    valid: errors.length === 0,
+    errors,
+    checked_at: new Date().toISOString(),
+  });
+});
+
+// POST /v1/execution-plans/:planId/approve-and-start — ApproveAndStartExecutionPlan
+app.post("/v1/execution-plans/:planId/approve-and-start", async (c) => {
+  const tenantId = c.get("tenantId");
+  const planId = c.req.param("planId");
+  const goalId = c.req.query("goal_id") ?? "";
+  if (!goalId) return c.json({detail: "goal_id query parameter required"}, 422);
+
+  interface ApproveRequest { approved_by: string; }
+  let body: ApproveRequest;
+  try { body = await c.req.json(); } catch { return c.json({detail: "invalid JSON body"}, 400); }
+  if (!body.approved_by) return c.json({detail: "approved_by is required"}, 422);
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") return c.json({detail: "goal not found"}, 404);
+  const currentHead = head.head as Record<string, unknown>;
+
+  const plans = Array.isArray(currentHead.execution_plans)
+    ? [...currentHead.execution_plans] as Array<Record<string, unknown> & {plan_id: string; status: string}>
+    : [];
+  const plan = plans.find(p => p.plan_id === planId);
+  if (!plan) return c.json({detail: `plan not found: ${planId}`}, 404);
+  if (plan.status !== "draft") return c.json({detail: `plan status is ${plan.status}, expected draft`}, 409);
+
+  // Approve: transition to approved.
+  plan.status = "approved";
+  plan.approved_by = body.approved_by;
+  plan.approved_at = new Date().toISOString();
+
+  // Trigger compile if compile endpoint data is present.
+  const stages = plan.stages as string[] ?? [];
+  const depthTier = plan.depth_tier as string ?? "A";
+  const sampleName = plan.sample_name as string ?? "unknown";
+  const compiled = compileTodoBundle({sample_name: sampleName, depth_tier: depthTier as "A" | "B" | "C", stages});
+
+  // Merge todos into projection.
+  const existingTodos = Array.isArray(currentHead.todos) ? [...currentHead.todos] as Array<{todo_id: string}> : [];
+  const existingIds = new Set(existingTodos.map(t => t.todo_id));
+  const newTodos = compiled.todos.filter(t => !existingIds.has(t.todo_id));
+  const allTodos = [...existingTodos, ...newTodos.map(t => ({
+    schema_version: "todo_item_v0", ...t,
+    priority: null, title: null, action_kind: null, task_domain: null,
+    capability_binding_ref: null, task_repository: null,
+    continuation_policy: null, removed_continuation_policy: null, excluded_agents: [],
+  }))];
+  allTodos.sort((a, b) => a.todo_id.localeCompare(b.todo_id));
+
+  // Merge dependencies.
+  const existingDeps = Array.isArray(currentHead.todo_dependencies)
+    ? [...currentHead.todo_dependencies] as TodoDependencyEdge[] : [];
+  const depKeys = new Set(existingDeps.map(d => `${d.upstream_todo_id}->${d.downstream_todo_id}`));
+  const newDeps = compiled.dependencies.filter(d => !depKeys.has(`${d.upstream_todo_id}->${d.downstream_todo_id}`));
+  const allDeps = [...existingDeps, ...newDeps];
+
+  const readModel = coordinationTodoReadModel(
+    allTodos as unknown as Array<Record<string, unknown>>,
+    TODO_CANONICAL_READ_RECORD_SCHEMA,
+  );
+
+  const nextProjection = {
+    ...currentHead,
+    execution_plans: plans,
+    goal_id: goalId,
+    todos: allTodos,
+    leases: Array.isArray(currentHead.leases) ? currentHead.leases : [],
+    todo_dependencies: allDeps,
+    todo_read_model: readModel,
+  };
+
+  const operationId = `plan-approve:${planId}:rev${plan.plan_revision}`;
+
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: head.provider_revision,
+    operation_id: operationId,
+    events: [
+      {type: "PlanRevisionApproved", payload: {plan_id: planId, approved_by: body.approved_by}},
+      {type: "InitialTodoSeeded", payload: {todo_count: newTodos.length, dep_count: newDeps.length}},
+    ],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "approved_and_started"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({
+      plan_id: planId,
+      status: "approved",
+      approved_by: body.approved_by,
+      todos_compiled: newTodos.length,
+      dependencies_compiled: newDeps.length,
+      total_todos: allTodos.length,
+    }, 200);
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// GET /v1/goals/:goalId/dependency-snapshot — read-only query
+app.get("/v1/goals/:goalId/dependency-snapshot", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") return c.json({detail: "goal not found"}, 404);
+  const currentHead = head.head as Record<string, unknown>;
+
+  const todos = Array.isArray(currentHead.todos) ? currentHead.todos : [];
+  const deps = Array.isArray(currentHead.todo_dependencies) ? currentHead.todo_dependencies : [];
+  const gates = Array.isArray(currentHead.human_gates) ? currentHead.human_gates : [];
+
+  return c.json({
+    goal_id: goalId,
+    cursor: head.cursor,
+    provider_revision: head.provider_revision,
+    todos,
+    dependencies: deps,
+    human_gates: gates,
+    snapshot_at: new Date().toISOString(),
+  });
+});
+
 // ─── Auto-gate: process receipt → gate transition (Phase 5) ──────────────────
 
 async function processGateTransition(
