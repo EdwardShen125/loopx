@@ -1410,6 +1410,274 @@ app.get("/v1/goals/:goalId/quota", async (c) => {
   });
 });
 
+// ─── PlanChangeSet (design §5.3.2: three-tier change rules) ─────────────────
+
+type ChangeClassification = "operational_change" | "bounded_plan_change" | "material_plan_change";
+
+interface PlanChangeSet {
+  change_set_id: string;
+  plan_id: string;
+  plan_revision: number;
+  classification: ChangeClassification;
+  reason: string;
+  evidence_refs: string[];
+  affected_scope: string[];
+  diff_summary: string;
+  risk_level: "low" | "medium" | "high";
+  cost_impact?: string;
+  recommended_action?: string;
+  submitted_by: string;
+}
+
+// POST /v1/execution-plans/:planId/changes — submit a PlanChangeSet
+app.post("/v1/execution-plans/:planId/changes", async (c) => {
+  const tenantId = c.get("tenantId");
+  const planId = c.req.param("planId");
+  const goalId = c.req.query("goal_id") ?? "";
+  if (!goalId) return c.json({detail: "goal_id query parameter required"}, 422);
+
+  let cs: PlanChangeSet;
+  try { cs = await c.req.json(); } catch { return c.json({detail: "invalid JSON body"}, 400); }
+  if (!cs.change_set_id || !cs.classification || !cs.reason) {
+    return c.json({detail: "change_set_id, classification, reason are required"}, 422);
+  }
+  if (!["operational_change", "bounded_plan_change", "material_plan_change"].includes(cs.classification)) {
+    return c.json({detail: `invalid classification: ${cs.classification}`}, 422);
+  }
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") return c.json({detail: "goal not found"}, 404);
+  const currentHead = head.head as Record<string, unknown>;
+
+  // Verify plan exists.
+  const plans = Array.isArray(currentHead.execution_plans)
+    ? currentHead.execution_plans as Array<{plan_id: string; status: string}>
+    : [];
+  const plan = plans.find(p => p.plan_id === planId);
+  if (!plan) return c.json({detail: `plan not found: ${planId}`}, 404);
+
+  // Three-tier rule (§5.3.2).
+  let autoApplied = false;
+  let newStatus: string;
+  let nextPlanRevision = (plan as any).plan_revision ?? 1;
+
+  if (cs.classification === "operational_change") {
+    // Auto-apply: just record audit event, no revision bump.
+    autoApplied = true;
+    newStatus = "auto_applied";
+  } else {
+    // bounded / material: create change_requested, needs approval.
+    newStatus = "change_requested";
+  }
+
+  // Store in projection.
+  const changeSets = Array.isArray(currentHead.plan_change_sets)
+    ? [...currentHead.plan_change_sets] as Array<Record<string, unknown>>
+    : [];
+  changeSets.push({ ...cs as unknown as Record<string, unknown>, goal_id: goalId, status: newStatus, auto_applied: autoApplied, submitted_at: new Date().toISOString() });
+
+  const nextProjection = {...currentHead, plan_change_sets: changeSets};
+  const operationId = `changeset:${cs.change_set_id}`;
+
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: head.provider_revision,
+    operation_id: operationId,
+    events: [{
+      type: `PlanChangeSet:${cs.classification}`,
+      payload: {
+        change_set_id: cs.change_set_id,
+        plan_id: planId,
+        classification: cs.classification,
+        auto_applied: autoApplied,
+        reason: cs.reason,
+      } as unknown as Record<string, unknown>,
+    }],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: newStatus}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({
+      change_set_id: cs.change_set_id,
+      classification: cs.classification,
+      status: newStatus,
+      auto_applied: autoApplied,
+      message: autoApplied
+        ? "operational change auto-applied (audit event recorded)"
+        : "change requested; awaiting approval",
+    }, 201);
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// POST /v1/plan-changes/:changeSetId/approve — approve a change set.
+app.post("/v1/plan-changes/:changeSetId/approve", async (c) => {
+  const tenantId = c.get("tenantId");
+  const changeSetId = c.req.param("changeSetId");
+  const goalId = c.req.query("goal_id") ?? "";
+  if (!goalId) return c.json({detail: "goal_id query parameter required"}, 422);
+
+  interface ApproveReq { approved_by: string; }
+  let body: ApproveReq;
+  try { body = await c.req.json(); } catch { return c.json({detail: "invalid JSON body"}, 400); }
+  if (!body.approved_by) return c.json({detail: "approved_by is required"}, 422);
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") return c.json({detail: "goal not found"}, 404);
+  const currentHead = head.head as Record<string, unknown>;
+
+  const changeSets = Array.isArray(currentHead.plan_change_sets)
+    ? [...currentHead.plan_change_sets] as Array<Record<string, unknown> & {change_set_id: string; status: string}>
+    : [];
+  const cs = changeSets.find(s => s.change_set_id === changeSetId);
+  if (!cs) return c.json({detail: `change set not found: ${changeSetId}`}, 404);
+  if (cs.status !== "change_requested") {
+    return c.json({detail: `change set status is ${cs.status}, expected change_requested`}, 409);
+  }
+
+  // Approve: bump plan revision, supersede old.
+  cs.status = "approved";
+  cs.approved_by = body.approved_by;
+  cs.approved_at = new Date().toISOString();
+
+  // Find associated plan and create successor revision.
+  const planId = cs.plan_id as string;
+  const plans = Array.isArray(currentHead.execution_plans)
+    ? [...currentHead.execution_plans] as Array<Record<string, unknown> & {plan_id: string; plan_revision?: number; status: string}>
+    : [];
+  const plan = plans.find(p => p.plan_id === planId);
+  if (plan) {
+    if (plan.status === "approved") plan.status = "superseded";
+    const newRev = plan.plan_revision as number + 1;
+    plans.push({
+      ...plan,
+      plan_revision: newRev,
+      status: "approved",
+      approved_by: body.approved_by,
+      approved_at: new Date().toISOString(),
+      superseded_from: planId,
+    });
+  }
+
+  const nextProjection = {...currentHead, plan_change_sets: changeSets, execution_plans: plans};
+  const operationId = `changeset-approve:${changeSetId}`;
+
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: head.provider_revision,
+    operation_id: operationId,
+    events: [{
+      type: "PlanChangeSetApproved",
+      payload: {change_set_id: changeSetId, approved_by: body.approved_by, plan_id: planId} as unknown as Record<string, unknown>,
+    }],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "approved"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({status: "approved", change_set_id: changeSetId, plan_id: planId, approved_by: body.approved_by});
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// POST /v1/plan-changes/:changeSetId/reject — reject a change set.
+app.post("/v1/plan-changes/:changeSetId/reject", async (c) => {
+  const tenantId = c.get("tenantId");
+  const changeSetId = c.req.param("changeSetId");
+  const goalId = c.req.query("goal_id") ?? "";
+  if (!goalId) return c.json({detail: "goal_id query parameter required"}, 422);
+
+  interface RejectReq { rejected_by: string; reason?: string; }
+  let body: RejectReq;
+  try { body = await c.req.json(); } catch { return c.json({detail: "invalid JSON body"}, 400); }
+  if (!body.rejected_by) return c.json({detail: "rejected_by is required"}, 422);
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") return c.json({detail: "goal not found"}, 404);
+  const currentHead = head.head as Record<string, unknown>;
+
+  const changeSets = Array.isArray(currentHead.plan_change_sets)
+    ? [...currentHead.plan_change_sets] as Array<Record<string, unknown> & {change_set_id: string; status: string}>
+    : [];
+  const cs = changeSets.find(s => s.change_set_id === changeSetId);
+  if (!cs) return c.json({detail: `change set not found: ${changeSetId}`}, 404);
+
+  cs.status = "rejected";
+  cs.rejected_by = body.rejected_by;
+  cs.rejected_reason = body.reason ?? "";
+
+  const nextProjection = {...currentHead, plan_change_sets: changeSets};
+  const operationId = `changeset-reject:${changeSetId}`;
+
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: head.provider_revision,
+    operation_id: operationId,
+    events: [{
+      type: "PlanChangeSetRejected",
+      payload: {change_set_id: changeSetId, rejected_by: body.rejected_by, reason: body.reason ?? ""} as unknown as Record<string, unknown>,
+    }],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "rejected"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({status: "rejected", change_set_id: changeSetId, rejected_by: body.rejected_by});
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// POST /v1/approvals — high-risk operation approval (§14.2.4)
+app.post("/v1/approvals", async (c) => {
+  const tenantId = c.get("tenantId");
+
+  interface ApprovalRequest {
+    approval_type: string;
+    subject_id: string;
+    subject_type: string;
+    approver_account_id: string;
+    reason: string;
+  }
+  let body: ApprovalRequest;
+  try { body = await c.req.json(); } catch { return c.json({detail: "invalid JSON body"}, 400); }
+  if (!body.approval_type || !body.subject_id || !body.approver_account_id) {
+    return c.json({detail: "approval_type, subject_id, approver_account_id are required"}, 422);
+  }
+
+  const goalId = c.req.query("goal_id") ?? "global";
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  const expectedRevision = head.status === "loaded" ? head.provider_revision : null;
+  const currentHead = head.status === "loaded" ? head.head as Record<string, unknown> : {};
+
+  const approvals = Array.isArray(currentHead.approvals)
+    ? [...currentHead.approvals] as Array<Record<string, unknown>>
+    : [];
+  const approvalId = `approval-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  approvals.push({
+    approval_id: approvalId,
+    ...body,
+    tenant_id: tenantId,
+    approved_at: new Date().toISOString(),
+  });
+
+  const nextProjection = {...currentHead, approvals};
+  const operationId = `approval:${approvalId}`;
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: expectedRevision,
+    operation_id: operationId,
+    events: [{type: "HighRiskApproval", payload: body as unknown as Record<string, unknown>}],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "approved"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({approval_id: approvalId, status: "approved"}, 201);
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
 // ─── Auto-gate: process receipt → gate transition (Phase 5) ──────────────────
 
 async function processGateTransition(
