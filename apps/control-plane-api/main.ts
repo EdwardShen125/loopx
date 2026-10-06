@@ -492,6 +492,25 @@ app.get("/v1/goals/:goalId/todos/:todoId/readiness", async (c) => {
   const deps = Array.isArray(currentHead.todo_dependencies) ? currentHead.todo_dependencies as TodoDependencyEdge[] : [];
 
   const readiness = checkReadiness(todoId, todos, deps);
+
+  // Human Gate check: if a dependency has a gate_id, verify it's approved.
+  const gates = Array.isArray(currentHead.human_gates)
+    ? currentHead.human_gates as Array<{gate_id: string; approved: boolean}>
+    : [];
+  const gateLookup = new Map(gates.map(g => [g.gate_id, g]));
+  for (const dep of deps) {
+    if (dep.downstream_todo_id !== todoId || !dep.gate_id) continue;
+    const gate = gateLookup.get(dep.gate_id);
+    if (!gate || !gate.approved) {
+      readiness.blocked_by.push({
+        todo_id: dep.upstream_todo_id,
+        status: `gate_pending:${dep.gate_id}`,
+        type: dep.dependency_type,
+      });
+    }
+  }
+  readiness.ready = readiness.blocked_by.length === 0;
+
   return c.json({todo_id: todoId, ...readiness});
 });
 
@@ -746,6 +765,310 @@ app.post("/v1/goals/:goalId/gate", async (c) => {
   }
 
   return c.json({status: "processed", transition, gate_id: gateId, stages});
+});
+
+// ─── Goal state read (for frontend visualization) ──────────────────────────
+
+app.get("/v1/goals/:goalId", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") {
+    return c.json({detail: "goal not found"}, 404);
+  }
+  const currentHead = head.head as Record<string, unknown>;
+  const todos = Array.isArray(currentHead.todos) ? currentHead.todos : [];
+  const deps = Array.isArray(currentHead.todo_dependencies) ? currentHead.todo_dependencies : [];
+
+  return c.json({
+    goal_id: goalId,
+    provider_revision: head.provider_revision,
+    cursor: head.cursor,
+    todos: todos,
+    dependencies: deps,
+  });
+});
+
+// ─── TodoActivation async flow (design §12.3) ────────────────────────────────
+
+interface TodoActivationRequest {
+  activation_id: string;
+  idempotency_key: string;
+  tenant_id: string;
+  project_id: string;
+  goal_id: string;
+  todo_id: string;
+  todo_aggregate_version: number;
+  loopx_event_id?: string;
+  source_commit_sha: string;
+  manifest_sha256: string;
+  work_unit_specs?: Array<Record<string, unknown>>;
+  required_capabilities?: string[];
+  priority?: number;
+  platform_resource_budget?: Record<string, unknown>;
+  requested_at: string;
+}
+
+// POST /v1/todo-activations: async activation with resource admission.
+// Returns accepted | resource_wait | rejected_permanent (per §12.3 states).
+app.post("/v1/todo-activations", async (c) => {
+  const tenantId = c.get("tenantId");
+
+  let req: TodoActivationRequest;
+  try {
+    req = await c.req.json();
+  } catch {
+    return c.json({detail: "invalid JSON body"}, 400);
+  }
+  if (!req.activation_id || !req.goal_id || !req.todo_id) {
+    return c.json({detail: "activation_id, goal_id, todo_id are required"}, 422);
+  }
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: req.goal_id});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") {
+    return c.json({
+      schema_version: "todo_activation_receipt_v1",
+      activation_id: req.activation_id,
+      tenant_id: tenantId,
+      status: "rejected_permanent",
+      reason_code: "goal_not_found",
+      created_at: new Date().toISOString(),
+    }, 404);
+  }
+
+  // Check idempotency via readReceipt.
+  const operationId = `activation:${req.activation_id}`;
+  const existing = await store.readReceipt(operationId);
+  if (existing.status === "found") {
+    const prior = existing.receipts as Array<{status?: string; reason_code?: string}>;
+    return c.json({
+      schema_version: "todo_activation_receipt_v1",
+      activation_id: req.activation_id,
+      tenant_id: tenantId,
+      status: prior[0]?.status ?? "accepted",
+      reason_code: prior[0]?.reason_code,
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  // Resource admission: check if the Goal has capacity for a new activation.
+  // Simplified v1: accept if goal exists and todo is in the projection.
+  const currentHead = head.head as Record<string, unknown>;
+  const todos = Array.isArray(currentHead.todos) ? currentHead.todos as Array<{todo_id: string; status: string}> : [];
+  const targetTodo = todos.find(t => t.todo_id === req.todo_id);
+
+  if (!targetTodo) {
+    return c.json({
+      schema_version: "todo_activation_receipt_v1",
+      activation_id: req.activation_id,
+      tenant_id: tenantId,
+      status: "rejected_permanent",
+      reason_code: "todo_not_found",
+      created_at: new Date().toISOString(),
+    }, 404);
+  }
+
+  if (targetTodo.status === "done") {
+    return c.json({
+      schema_version: "todo_activation_receipt_v1",
+      activation_id: req.activation_id,
+      tenant_id: tenantId,
+      status: "rejected_permanent",
+      reason_code: "todo_already_completed",
+      created_at: new Date().toISOString(),
+    }, 409);
+  }
+
+  // Accepted: store activation receipt atomically.
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: head.provider_revision,
+    operation_id: operationId,
+    events: [{
+      type: "TodoActivated",
+      payload: {
+        activation_id: req.activation_id,
+        todo_id: req.todo_id,
+        source_commit_sha: req.source_commit_sha,
+        manifest_sha256: req.manifest_sha256,
+        requested_at: req.requested_at,
+      } as unknown as Record<string, unknown>,
+    }],
+    next_projection: currentHead,
+    receipts: [{
+      operation_id: operationId,
+      status: "accepted",
+      activation_id: req.activation_id,
+    }],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({
+      schema_version: "todo_activation_receipt_v1",
+      activation_id: req.activation_id,
+      tenant_id: tenantId,
+      status: "accepted",
+      created_at: new Date().toISOString(),
+    }, 201);
+  }
+  if (commitResult.status === "conflict") {
+    return c.json({
+      schema_version: "todo_activation_receipt_v1",
+      activation_id: req.activation_id,
+      tenant_id: tenantId,
+      status: "resource_wait",
+      reason_code: "concurrent_modification",
+      created_at: new Date().toISOString(),
+    }, 409);
+  }
+  return c.json({
+    schema_version: "todo_activation_receipt_v1",
+    activation_id: req.activation_id,
+    tenant_id: tenantId,
+    status: "rejected_permanent",
+    reason_code: "internal_error",
+    created_at: new Date().toISOString(),
+  }, 500);
+});
+
+// POST /v1/todo-activations/:activationId/ack: acknowledge an activation receipt.
+app.post("/v1/todo-activations/:activationId/ack", async (c) => {
+  const tenantId = c.get("tenantId");
+  const activationId = c.req.param("activationId");
+
+  // Verify the activation exists in our event log.
+  const operationId = `activation:${activationId}`;
+
+  // Search across known goals — in production use a dedicated lookup table.
+  const goalId = c.req.query("goal_id") ?? "";
+  if (!goalId) {
+    return c.json({detail: "goal_id query parameter required for ack"}, 422);
+  }
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const existing = await store.readReceipt(operationId);
+  if (existing.status !== "found") {
+    return c.json({detail: "activation not found"}, 404);
+  }
+
+  return c.json({
+    schema_version: "loopx_command_receipt_v1",
+    command_type: "ack_todo_activation",
+    command_id: activationId,
+    status: "accepted",
+    received_at: new Date().toISOString(),
+  });
+});
+
+// ─── Human Gate: manual approval for high-risk operations (§14.2.4) ──────────
+
+// POST /v1/goals/:goalId/gates/:gateId/approve
+// Marks a human gate as approved. Only approved gates allow downstream Todos to proceed.
+app.post("/v1/goals/:goalId/gates/:gateId/approve", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+  const gateId = c.req.param("gateId");
+
+  interface GateApproval {
+    approved_by: string;
+    reason?: string;
+  }
+  let body: GateApproval;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({detail: "invalid JSON body"}, 400);
+  }
+  if (!body.approved_by) {
+    return c.json({detail: "approved_by is required"}, 422);
+  }
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") {
+    return c.json({detail: "goal not found"}, 404);
+  }
+  const currentHead = head.head as Record<string, unknown>;
+
+  // Store gate approvals in projection.
+  const gates = Array.isArray(currentHead.human_gates)
+    ? [...currentHead.human_gates] as Array<{gate_id: string; approved: boolean; approved_by?: string; approved_at?: string}>
+    : [];
+  const existing = gates.find(g => g.gate_id === gateId);
+  if (existing?.approved) {
+    return c.json({status: "already_approved", gate_id: gateId, approved_by: existing.approved_by});
+  }
+
+  if (existing) {
+    existing.approved = true;
+    existing.approved_by = body.approved_by;
+    existing.approved_at = new Date().toISOString();
+  } else {
+    gates.push({
+      gate_id: gateId,
+      approved: true,
+      approved_by: body.approved_by,
+      approved_at: new Date().toISOString(),
+    });
+  }
+
+  const nextProjection = {...currentHead, human_gates: gates};
+  const operationId = `gate-approve:${gateId}:${Date.now()}`;
+
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: head.provider_revision,
+    operation_id: operationId,
+    events: [{
+      type: "HumanGateApproved",
+      payload: {gate_id: gateId, approved_by: body.approved_by, reason: body.reason ?? ""} as unknown as Record<string, unknown>,
+    }],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "applied"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({status: "approved", gate_id: gateId, approved_by: body.approved_by});
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// GET /v1/goals/:goalId/gates — list all human gates and their status.
+app.get("/v1/goals/:goalId/gates", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") {
+    return c.json({detail: "goal not found"}, 404);
+  }
+  const currentHead = head.head as Record<string, unknown>;
+  const gates = Array.isArray(currentHead.human_gates) ? currentHead.human_gates : [];
+  const todos = Array.isArray(currentHead.todos) ? currentHead.todos as Array<{todo_id: string; stage_id?: string}> : [];
+  const deps = Array.isArray(currentHead.todo_dependencies) ? currentHead.todo_dependencies as TodoDependencyEdge[] : [];
+
+  // Compute which gates are blocking.
+  const gateStatus = gates.map(g => ({
+    ...g,
+    blocking_todos: deps
+      .filter(d => d.gate_id === g.gate_id)
+      .map(d => d.downstream_todo_id),
+  }));
+
+  // Also show implicit gates from gate_acceptance dependencies.
+  const implicitGates = deps
+    .filter(d => d.dependency_type === "gate_acceptance" && d.gate_id)
+    .filter(d => !gates.some(g => g.gate_id === d.gate_id))
+    .map(d => ({
+      gate_id: d.gate_id,
+      approved: false,
+      blocking_todos: [d.downstream_todo_id],
+      implicit: true,
+    }));
+
+  return c.json({gates: [...gateStatus, ...implicitGates]});
 });
 
 // ─── Auto-gate: process receipt → gate transition (Phase 5) ──────────────────
