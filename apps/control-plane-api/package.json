@@ -1,0 +1,23 @@
+{
+  "name": "@loopx/control-plane-api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "node --experimental-strip-types main.ts",
+    "start": "node --experimental-strip-types main.ts",
+    "test": "node --no-warnings --experimental-strip-types --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "hono": "^4.6.0",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "@types/pg": "^8.23.0"
+  }
+}
