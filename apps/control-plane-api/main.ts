@@ -244,10 +244,19 @@ app.post("/v1/receipts/platform", async (c) => {
   });
 
   if (commitResult.status === "applied") {
+    // Auto-gate: process the receipt as a Gate transition (Phase 5).
+    let gateResult: {transition: string; from?: string; to?: string} | null = null;
+    try {
+      gateResult = await processGateTransition(tenantId, body.goal_id, body);
+    } catch (gateErr) {
+      console.warn("auto-gate failed (non-blocking):", gateErr);
+    }
+
     return c.json({
       status: "accepted",
       receipt_id: receiptId,
       idempotency_key: key,
+      gate: gateResult,
     });
   }
 
@@ -738,6 +747,69 @@ app.post("/v1/goals/:goalId/gate", async (c) => {
 
   return c.json({status: "processed", transition, gate_id: gateId, stages});
 });
+
+// ─── Auto-gate: process receipt → gate transition (Phase 5) ──────────────────
+
+async function processGateTransition(
+  tenantId: string,
+  goalId: string,
+  receipt: PlatformAnalysisReceipt,
+): Promise<{transition: string; from?: string; to?: string} | null> {
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") return null;
+
+  const currentHead = head.head as Record<string, unknown>;
+  const todos = Array.isArray(currentHead.todos)
+    ? currentHead.todos as Array<{todo_id: string; stage_id?: string; status: string; done?: boolean}>
+    : [];
+  const stages = [...new Set(todos.map(t => t.stage_id).filter(Boolean))] as string[];
+  if (stages.length === 0) return null;
+
+  const transition = convertGateReceipt(receipt as unknown as PlatformAnalysisReceiptInput, stages);
+  if (transition.action === "no_change") return {transition: "no_change"};
+
+  let updatedTodos = todos;
+  if (transition.action === "advance_stage" || transition.action === "complete_goal") {
+    const targetStage = transition.action === "advance_stage" ? transition.from_stage : transition.stage;
+    updatedTodos = todos.map(t =>
+      t.stage_id === targetStage ? {...t, status: "done", done: true} : t
+    );
+  } else if (transition.action === "block") {
+    updatedTodos = todos.map(t =>
+      t.stage_id === transition.stage ? {...t, status: "blocked"} : t
+    );
+  }
+
+  const sortedTodos = [...updatedTodos].sort((a, b) => a.todo_id.localeCompare(b.todo_id));
+  const readModel = coordinationTodoReadModel(
+    sortedTodos as unknown as Array<Record<string, unknown>>,
+    TODO_CANONICAL_READ_RECORD_SCHEMA,
+  );
+  const nextProjection = {...currentHead, todos: sortedTodos, todo_read_model: readModel};
+  const operationId = `gate-auto:${receipt.idempotency_key}`;
+
+  // Idempotency check.
+  const existing = await store.readReceipt(operationId);
+  if (existing.status === "found") return {transition: "duplicate"};
+
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: head.provider_revision,
+    operation_id: operationId,
+    events: [{type: `GateTransition:${transition.action}`, payload: {receipt_key: receipt.idempotency_key}}],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "applied"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return {
+      transition: transition.action,
+      from: "from_stage" in transition ? transition.from_stage : undefined,
+      to: "to_stage" in transition ? transition.to_stage : undefined,
+    };
+  }
+  return null;
+}
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
