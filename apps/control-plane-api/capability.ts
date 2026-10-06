@@ -14,7 +14,7 @@
 
 export interface GoalSpec {
   sample_name: string;
-  depth_tier: "A" | "B" | "C";
+  depth_tier?: "A" | "B" | "C";  // optional: per-stage depth comes from Pack definitions
   stages: string[];  // e.g. ["L0", "L2", "L3"]
 }
 
@@ -53,13 +53,14 @@ export function compileTodoBundle(spec: GoalSpec): {
   const todos: CompiledTodo[] = [];
   const dependencies: CompiledDependency[] = [];
   let index = 0;
+  const defaultDepth = spec.depth_tier ?? "A";
 
   const stageIds = spec.stages;
   for (let s = 0; s < stageIds.length; s++) {
     const stageId = stageIds[s];
-    const todoId = `todo_${stageId.toLowerCase()}_${spec.depth_tier.toLowerCase()}_${sanitize(spec.sample_name)}`;
+    const todoId = `todo_${stageId.toLowerCase()}_${defaultDepth.toLowerCase()}_${sanitize(spec.sample_name)}`;
     const prevTodoId = s > 0
-      ? `todo_${stageIds[s - 1].toLowerCase()}_${spec.depth_tier.toLowerCase()}_${sanitize(spec.sample_name)}`
+      ? `todo_${stageIds[s - 1].toLowerCase()}_${defaultDepth.toLowerCase()}_${sanitize(spec.sample_name)}`
       : null;
 
     todos.push({
@@ -84,7 +85,7 @@ export function compileTodoBundle(spec: GoalSpec): {
         downstream_todo_id: todoId,
         dependency_type: "hard_completion",
         upstream_commit_sha: null,
-        gate_id: `gate_${stageIds[s - 1].toLowerCase()}_${spec.depth_tier.toLowerCase()}`,
+        gate_id: `gate_${stageIds[s - 1].toLowerCase()}_${defaultDepth.toLowerCase()}`,
       });
     }
   }

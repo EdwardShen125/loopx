@@ -615,8 +615,8 @@ app.post("/v1/goals/:goalId/compile", async (c) => {
   } catch {
     return c.json({detail: "invalid JSON body"}, 400);
   }
-  if (!spec.sample_name || !spec.depth_tier || !spec.stages?.length) {
-    return c.json({detail: "sample_name, depth_tier, and stages are required"}, 422);
+  if (!spec.sample_name || !spec.stages?.length) {
+    return c.json({detail: "sample_name and stages are required"}, 422);
   }
 
   const compiled = compileTodoBundle(spec);
@@ -1238,9 +1238,9 @@ app.post("/v1/execution-plans/:planId/approve-and-start", async (c) => {
 
   // Trigger compile if compile endpoint data is present.
   const stages = plan.stages as string[] ?? [];
-  const depthTier = plan.depth_tier as string ?? "A";
+  const depthTier = plan.depth_tier as string ?? undefined;
   const sampleName = plan.sample_name as string ?? "unknown";
-  const compiled = compileTodoBundle({sample_name: sampleName, depth_tier: depthTier as "A" | "B" | "C", stages});
+  const compiled = compileTodoBundle({sample_name: sampleName, depth_tier: depthTier as "A" | "B" | "C" | undefined, stages});
 
   // Merge todos into projection.
   const existingTodos = Array.isArray(currentHead.todos) ? [...currentHead.todos] as Array<{todo_id: string}> : [];
