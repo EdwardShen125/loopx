@@ -882,7 +882,25 @@ app.post("/v1/todo-activations", async (c) => {
     }, 409);
   }
 
-  // Accepted: store activation receipt atomically.
+  // Quota check (design §4: Tenant/Goal 配额).
+  const quota = (currentHead.quota as GoalQuota | undefined) ?? {
+    max_activations: 100, max_active_leases: 10,
+    current_activations: 0, current_active_leases: 0,
+  };
+  if (quota.current_activations >= quota.max_activations) {
+    return c.json({
+      schema_version: "todo_activation_receipt_v1",
+      activation_id: req.activation_id,
+      tenant_id: tenantId,
+      status: "resource_wait",
+      reason_code: "quota_activations_exhausted",
+      created_at: new Date().toISOString(),
+    }, 429);
+  }
+
+  // Accepted: store activation receipt atomically + increment quota counter.
+  const updatedQuota = { ...quota, current_activations: quota.current_activations + 1 };
+  const nextHead = { ...currentHead, quota: updatedQuota };
   const commitResult = await store.commitAuthority({
     expected_provider_revision: head.provider_revision,
     operation_id: operationId,
@@ -896,7 +914,7 @@ app.post("/v1/todo-activations", async (c) => {
         requested_at: req.requested_at,
       } as unknown as Record<string, unknown>,
     }],
-    next_projection: currentHead,
+    next_projection: nextHead,
     receipts: [{
       operation_id: operationId,
       status: "accepted",
@@ -1306,6 +1324,89 @@ app.get("/v1/goals/:goalId/dependency-snapshot", async (c) => {
     dependencies: deps,
     human_gates: gates,
     snapshot_at: new Date().toISOString(),
+  });
+});
+
+// ─── Quota management (design §4: Tenant/Goal 配额快照) ─────────────────────
+
+interface GoalQuota {
+  max_activations: number;         // max total TodoActivations for this Goal
+  max_active_leases: number;       // max concurrent active leases
+  current_activations: number;     // counter (maintained by activation commits)
+  current_active_leases: number;   // gauge (computed from projection leases)
+}
+
+// POST /v1/goals/:goalId/quota — Set or update quota limits.
+app.post("/v1/goals/:goalId/quota", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+
+  interface QuotaLimits { max_activations?: number; max_active_leases?: number; }
+  let body: QuotaLimits;
+  try { body = await c.req.json(); } catch { return c.json({detail: "invalid JSON body"}, 400); }
+  if (body.max_activations === undefined && body.max_active_leases === undefined) {
+    return c.json({detail: "at least one of max_activations or max_active_leases is required"}, 422);
+  }
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  const expectedRevision = head.status === "loaded" ? head.provider_revision : null;
+  const currentHead = head.status === "loaded" ? head.head as Record<string, unknown> : {};
+
+  const existing = (currentHead.quota as GoalQuota | undefined) ?? {
+    max_activations: 100, max_active_leases: 10,
+    current_activations: 0, current_active_leases: 0,
+  };
+
+  const quota: GoalQuota = {
+    ...existing,
+    max_activations: body.max_activations ?? existing.max_activations,
+    max_active_leases: body.max_active_leases ?? existing.max_active_leases,
+  };
+
+  const nextProjection = {...currentHead, quota};
+  const operationId = `quota-set:${Date.now()}`;
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: expectedRevision,
+    operation_id: operationId,
+    events: [{type: "QuotaUpdated", payload: quota as unknown as Record<string, unknown>}],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "applied"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({status: "updated", quota}, 200);
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// GET /v1/goals/:goalId/quota — Get current quota status.
+app.get("/v1/goals/:goalId/quota", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") return c.json({detail: "goal not found"}, 404);
+
+  const currentHead = head.head as Record<string, unknown>;
+  const quota = (currentHead.quota as GoalQuota | undefined) ?? {
+    max_activations: 100, max_active_leases: 10,
+    current_activations: 0, current_active_leases: 0,
+  };
+
+  // Compute current_active_leases from projection.
+  const leases = Array.isArray(currentHead.leases) ? currentHead.leases : [];
+  const activeLeases = leases.filter((l: Record<string, unknown>) =>
+    l.status === "active" || l.claimed_by !== null
+  ).length;
+
+  return c.json({
+    goal_id: goalId,
+    ...quota,
+    current_active_leases: activeLeases,
+    activations_remaining: Math.max(0, quota.max_activations - quota.current_activations),
+    leases_remaining: Math.max(0, quota.max_active_leases - activeLeases),
   });
 });
 
