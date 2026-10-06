@@ -35,6 +35,12 @@ import {
   buildBackfillMutations,
   type TodoDependencyEdge,
 } from "./dependency.ts";
+import {
+  compileTodoBundle,
+  convertGateReceipt,
+  type GoalSpec,
+  type PlatformAnalysisReceiptInput,
+} from "./capability.ts";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -566,6 +572,171 @@ app.post("/v1/goals/:goalId/backfill", async (c) => {
     });
   }
   return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// ─── Phase 5: Reverse Analysis Capability ─────────────────────────────────────
+
+// Compile a GoalSpec into an L0-L7/A-B-C Todo bundle with dependencies.
+app.post("/v1/goals/:goalId/compile", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+
+  let spec: GoalSpec;
+  try {
+    spec = await c.req.json();
+  } catch {
+    return c.json({detail: "invalid JSON body"}, 400);
+  }
+  if (!spec.sample_name || !spec.depth_tier || !spec.stages?.length) {
+    return c.json({detail: "sample_name, depth_tier, and stages are required"}, 422);
+  }
+
+  const compiled = compileTodoBundle(spec);
+
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  const expectedRevision = head.status === "loaded" ? head.provider_revision : null;
+  const currentHead = head.status === "loaded" ? head.head as Record<string, unknown> : {};
+
+  // Merge with existing todos.
+  const existingTodos = Array.isArray(currentHead.todos) ? [...currentHead.todos] as Array<{todo_id: string}> : [];
+  const existingIds = new Set(existingTodos.map(t => t.todo_id));
+  const newTodos = compiled.todos.filter(t => !existingIds.has(t.todo_id));
+  const allTodos = [...existingTodos, ...newTodos.map(t => ({
+    schema_version: "todo_item_v0",
+    ...t,
+    priority: null,
+    title: null,
+    action_kind: null,
+    task_domain: null,
+    capability_binding_ref: null,
+    task_repository: null,
+    continuation_policy: null,
+    removed_continuation_policy: null,
+    excluded_agents: [],
+  }))];
+  allTodos.sort((a, b) => a.todo_id.localeCompare(b.todo_id));
+
+  const readModel = coordinationTodoReadModel(
+    allTodos as unknown as Array<Record<string, unknown>>,
+    TODO_CANONICAL_READ_RECORD_SCHEMA,
+  );
+
+  // Merge with existing dependencies.
+  const existingDeps = Array.isArray(currentHead.todo_dependencies) ? [...currentHead.todo_dependencies] as TodoDependencyEdge[] : [];
+  const depKeys = new Set(existingDeps.map(d => `${d.upstream_todo_id}->${d.downstream_todo_id}`));
+  const newDeps = compiled.dependencies.filter(d => !depKeys.has(`${d.upstream_todo_id}->${d.downstream_todo_id}`));
+  const allDeps = [...existingDeps, ...newDeps];
+
+  const nextProjection = {
+    ...currentHead,
+    goal_id: goalId,
+    todos: allTodos,
+    leases: Array.isArray(currentHead.leases) ? currentHead.leases : [],
+    todo_dependencies: allDeps,
+    todo_read_model: readModel,
+  };
+
+  const operationId = `compile:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  const commitResult = await store.commitAuthority({
+    expected_provider_revision: expectedRevision,
+    operation_id: operationId,
+    events: [
+      ...newTodos.map(t => ({type: "TodoCompiled", payload: {todo_id: t.todo_id, stage_id: t.stage_id, depth_tier: t.depth_tier}})),
+      ...newDeps.map(d => ({type: "DependencyCompiled", payload: d as unknown as Record<string, unknown>})),
+    ],
+    next_projection: nextProjection,
+    receipts: [{operation_id: operationId, status: "applied"}],
+  });
+
+  if (commitResult.status === "applied") {
+    return c.json({
+      status: "compiled",
+      goal_id: goalId,
+      todos_created: newTodos.length,
+      dependencies_created: newDeps.length,
+      total_todos: allTodos.length,
+      total_dependencies: allDeps.length,
+      stages: spec.stages,
+    }, 201);
+  }
+  return c.json({detail: "commit failed", reason: commitResult.status}, 500);
+});
+
+// Process a Gate Receipt: convert PlatformAnalysisReceipt to LoopX Gate transition.
+app.post("/v1/goals/:goalId/gate", async (c) => {
+  const tenantId = c.get("tenantId");
+  const goalId = c.req.param("goalId");
+
+  let receipt: PlatformAnalysisReceiptInput;
+  try {
+    receipt = await c.req.json();
+  } catch {
+    return c.json({detail: "invalid JSON body"}, 400);
+  }
+
+  // Determine stage sequence from the head's todo stage_ids.
+  const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
+  const head = await store.loadAuthority();
+  if (head.status !== "loaded") {
+    return c.json({detail: "goal not found"}, 404);
+  }
+  const currentHead = head.head as Record<string, unknown>;
+  const todos = Array.isArray(currentHead.todos) ? currentHead.todos as Array<{todo_id: string; stage_id?: string}> : [];
+  const stages = [...new Set(todos.map(t => t.stage_id).filter(Boolean))] as string[];
+
+  if (stages.length === 0) {
+    return c.json({detail: "no stages found in goal"}, 422);
+  }
+
+  const transition = convertGateReceipt(receipt, stages);
+
+  // Apply gate transition: update the source todo status + open gate.
+  const gateId = "gate_id" in transition ? transition.gate_id : null;
+  let updatedTodos = todos;
+  let eventPayload: Record<string, unknown> = {transition, receipt_idempotency_key: receipt.idempotency_key};
+
+  if (transition.action === "advance_stage") {
+    updatedTodos = todos.map(t =>
+      t.stage_id === transition.from_stage ? {...t, status: "done", done: true} : t
+    );
+  } else if (transition.action === "block") {
+    updatedTodos = todos.map(t =>
+      t.stage_id === transition.stage ? {...t, status: "blocked"} : t
+    );
+  } else if (transition.action === "complete_goal") {
+    updatedTodos = todos.map(t => ({...t, status: "done", done: true}));
+  }
+
+  if (transition.action !== "no_change") {
+    const sortedTodos = [...updatedTodos].sort((a, b) => a.todo_id.localeCompare(b.todo_id));
+    const readModel = coordinationTodoReadModel(
+      sortedTodos as unknown as Array<Record<string, unknown>>,
+      TODO_CANONICAL_READ_RECORD_SCHEMA,
+    );
+    const nextProjection = {...currentHead, todos: sortedTodos, todo_read_model: readModel};
+    const operationId = `gate:${receipt.idempotency_key}`;
+
+    // Idempotency: check for existing receipt with same operation.
+    const existing = await store.readReceipt(operationId);
+    if (existing.status === "found") {
+      return c.json({status: "duplicate", transition}, 200);
+    }
+
+    const commitResult = await store.commitAuthority({
+      expected_provider_revision: head.provider_revision,
+      operation_id: operationId,
+      events: [{type: `GateTransition:${transition.action}`, payload: eventPayload}],
+      next_projection: nextProjection,
+      receipts: [{operation_id: operationId, status: "applied", transition: transition.action}],
+    });
+
+    if (commitResult.status !== "applied") {
+      return c.json({detail: "gate commit failed", reason: commitResult.status}, 500);
+    }
+  }
+
+  return c.json({status: "processed", transition, gate_id: gateId, stages});
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
