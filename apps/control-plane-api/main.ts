@@ -884,7 +884,7 @@ app.post("/v1/todo-activations", async (c) => {
 
   // Quota check (design §4: Tenant/Goal 配额).
   const quota = (currentHead.quota as GoalQuota | undefined) ?? {
-    max_activations: 100, max_active_leases: 10,
+    max_activations: 100, max_active_leases: 10, max_analysis_seconds: 0,
     current_activations: 0, current_active_leases: 0,
   };
   if (quota.current_activations >= quota.max_activations) {
@@ -1332,6 +1332,7 @@ app.get("/v1/goals/:goalId/dependency-snapshot", async (c) => {
 interface GoalQuota {
   max_activations: number;         // max total TodoActivations for this Goal
   max_active_leases: number;       // max concurrent active leases
+  max_analysis_seconds: number;    // Goal time budget (platform-charged, §4)
   current_activations: number;     // counter (maintained by activation commits)
   current_active_leases: number;   // gauge (computed from projection leases)
 }
@@ -1341,11 +1342,12 @@ app.post("/v1/goals/:goalId/quota", async (c) => {
   const tenantId = c.get("tenantId");
   const goalId = c.req.param("goalId");
 
-  interface QuotaLimits { max_activations?: number; max_active_leases?: number; }
+  interface QuotaLimits { max_activations?: number; max_active_leases?: number; max_analysis_seconds?: number; }
   let body: QuotaLimits;
   try { body = await c.req.json(); } catch { return c.json({detail: "invalid JSON body"}, 400); }
-  if (body.max_activations === undefined && body.max_active_leases === undefined) {
-    return c.json({detail: "at least one of max_activations or max_active_leases is required"}, 422);
+  if (body.max_activations === undefined && body.max_active_leases === undefined
+      && body.max_analysis_seconds === undefined) {
+    return c.json({detail: "at least one quota limit is required"}, 422);
   }
 
   const store = new PostgreSqlAuthorityStore(database, {tenant_id: tenantId, goal_id: goalId});
@@ -1354,7 +1356,7 @@ app.post("/v1/goals/:goalId/quota", async (c) => {
   const currentHead = head.status === "loaded" ? head.head as Record<string, unknown> : {};
 
   const existing = (currentHead.quota as GoalQuota | undefined) ?? {
-    max_activations: 100, max_active_leases: 10,
+    max_activations: 100, max_active_leases: 10, max_analysis_seconds: 0,
     current_activations: 0, current_active_leases: 0,
   };
 
@@ -1362,6 +1364,7 @@ app.post("/v1/goals/:goalId/quota", async (c) => {
     ...existing,
     max_activations: body.max_activations ?? existing.max_activations,
     max_active_leases: body.max_active_leases ?? existing.max_active_leases,
+    max_analysis_seconds: body.max_analysis_seconds ?? existing.max_analysis_seconds,
   };
 
   const nextProjection = {...currentHead, quota};
@@ -1391,7 +1394,7 @@ app.get("/v1/goals/:goalId/quota", async (c) => {
 
   const currentHead = head.head as Record<string, unknown>;
   const quota = (currentHead.quota as GoalQuota | undefined) ?? {
-    max_activations: 100, max_active_leases: 10,
+    max_activations: 100, max_active_leases: 10, max_analysis_seconds: 0,
     current_activations: 0, current_active_leases: 0,
   };
 
