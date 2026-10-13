@@ -786,6 +786,7 @@ app.get("/v1/goals/:goalId", async (c) => {
     goal_id: goalId,
     provider_revision: head.provider_revision,
     cursor: head.cursor,
+    quota: currentHead.quota ?? null,
     todos: todos,
     dependencies: deps,
   });
